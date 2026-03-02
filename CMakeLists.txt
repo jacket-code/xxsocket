@@ -23,6 +23,9 @@ target_include_directories(poker_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
 add_executable(poker_server
   src/server/main.cpp
   src/server/tcp_server.cpp
+  src/server/app_server.cpp
+  src/server/store.cpp
+  # legacy single-table protocol (kept for reference; not used by main)
   src/server/protocol.cpp
 )
 target_include_directories(poker_server PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)

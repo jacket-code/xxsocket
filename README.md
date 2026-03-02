@@ -12,7 +12,7 @@ current version: 0.0.330.3
 ```bash
 cmake -S . -B build
 cmake --build build -j
-./build/poker_server 7777
+./build/poker_server 7777 data
 ```
 
 ### 快速试玩（用 netcat）
@@ -27,35 +27,49 @@ nc 127.0.0.1 7777
 
 ```json
 {"type":"hello","name":"Alice"}
-{"type":"sit","seat":0,"chips":10000}
-{"type":"ready","ready":true}
+{"type":"sit","tableId":1,"seat":0,"buyin":10000}
+{"type":"ready","tableId":1,"ready":true}
 ```
 
 另一个终端：
 
 ```json
 {"type":"hello","name":"Bob"}
-{"type":"sit","seat":1,"chips":10000}
-{"type":"ready","ready":true}
+{"type":"sit","tableId":1,"seat":1,"buyin":10000}
+{"type":"ready","tableId":1,"ready":true}
 ```
 
 轮到你行动时发送：
 
 ```json
-{"type":"action","action":"check"}
+{"type":"action","tableId":1,"action":"check"}
 ```
 
 或：
 
 ```json
-{"type":"action","action":"call"}
+{"type":"action","tableId":1,"action":"call"}
 ```
 
 下注/加注使用 `amount` 表示 **本轮下注总额（raise/bet to）**：
 
 ```json
-{"type":"action","action":"bet","amount":200}
-{"type":"action","action":"raise","amount":500}
+{"type":"action","tableId":1,"action":"bet","amount":200}
+{"type":"action","tableId":1,"action":"raise","amount":500}
+```
+
+### 常用消息（节选）
+
+```json
+{"type":"list_rooms"}
+{"type":"create_room","roomType":"private","name":"myroom","password":"1234","maxSeats":6,"sb":50,"bb":100,"buyinMin":1000,"buyinMax":20000}
+{"type":"join_room","roomId":2,"password":"1234"}
+{"type":"list_tables","roomId":2}
+{"type":"observe","tableId":1,"on":true}
+{"type":"auto","tableId":1,"on":true}
+{"type":"topup","tableId":1,"amount":5000}
+{"type":"hand_history","tableId":1,"handId":1}
+{"type":"tournament_register","roomId":3}
 ```
 
 ### 代码位置
