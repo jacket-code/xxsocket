@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <optional>
 #include <random>
 #include <string>
@@ -21,6 +22,7 @@ struct SeatState {
   std::string name;
   int64_t chips = 0;
   bool ready = false;
+  bool autoMode = false; // timeout托管：true 时超时自动行动
 
   PlayerStatus status = PlayerStatus::Empty;
   std::array<Card, 2> hole{};
@@ -49,8 +51,10 @@ struct TableSnapshot {
   int sbSeat = -1;
   int bbSeat = -1;
   Street street = Street::Preflop;
+  uint64_t handId = 0;
 
   int toAct = -1;
+  int64_t actionDeadlineMs = 0; // 0 表示无
   int64_t pot = 0;
   int64_t currentBet = 0;
   int64_t smallBlind = 0;
@@ -77,9 +81,14 @@ public:
 
   bool seatPlayer(int seatIdx, std::string playerId, std::string name, int64_t chips);
   bool setReady(const std::string& playerId, bool ready);
+  bool setAutoMode(const std::string& playerId, bool autoMode);
+  bool topUp(const std::string& playerId, int64_t amount);
   bool leave(const std::string& playerId);
 
   bool startHandIfReady();
+  void setBlinds(int64_t smallBlind, int64_t bigBlind);
+  void setActionTimeoutMs(int64_t ms);
+  void tick(int64_t nowMs); // 用于超时处理/比赛盲注推进（由上层定时调用）
 
   struct Action {
     std::string type;   // "fold","check","call","bet","raise"
@@ -88,6 +97,8 @@ public:
   bool act(const std::string& playerId, const Action& action, std::string& err);
 
   int64_t pot() const { return pot_; }
+  std::vector<std::string> getHandHistory(uint64_t handId, int limit = 200) const;
+  uint64_t currentHandId() const { return handId_; }
 
 private:
   Config cfg_;
@@ -99,6 +110,9 @@ private:
   int sbSeat_ = -1;
   int bbSeat_ = -1;
   int toAct_ = -1;
+  int64_t actionTimeoutMs_ = 15000;
+  int64_t actionDeadlineMs_ = 0;
+  uint64_t handId_ = 0;
 
   int64_t pot_ = 0;
   int64_t currentBet_ = 0;      // highest betThisStreet in current street
@@ -112,6 +126,13 @@ private:
   std::vector<bool> needAction_;
 
   std::mt19937_64 rng_;
+
+  struct HandLog {
+    uint64_t handId = 0;
+    std::vector<std::string> events;
+  };
+  std::deque<HandLog> history_; // keep last N hands
+  std::vector<std::string> curEvents_;
 
   int activePlayersInHand() const;
   int seatedPlayersReady() const;
@@ -129,6 +150,8 @@ private:
   void startBettingRound(Street st, int firstToAct);
   void advanceStreetOrShowdown();
   void settleShowdown();
+  void setToAct(int seatIdx, int64_t nowMs);
+  void logEvent(std::string ev);
 
   LegalActions legalForSeat(int seatIdx) const;
   bool applyBetTo(int seatIdx, int64_t betTo, std::string& err);

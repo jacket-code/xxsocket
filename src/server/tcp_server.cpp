@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <chrono>
 
 namespace server {
 
@@ -49,68 +50,78 @@ void TcpServer::broadcastLine(const std::vector<int64_t>& clientIds, const std::
   for (auto id : clientIds) (void)sendLine(id, line);
 }
 
-void TcpServer::run(const LineHandler& onLine, const DisconnectHandler& onDisconnect) {
-  while (true) {
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    auto listenFd = listenSock_.native_handle();
-    FD_SET(listenFd, &rfds);
-    purelib::net::socket_native_type maxfd = listenFd;
-    for (const auto& c : clients_) {
-      auto fd = c.sock.native_handle();
-      FD_SET(fd, &rfds);
-      if (fd > maxfd) maxfd = fd;
-    }
+void TcpServer::pollOnce(int timeoutMs, const LineHandler& onLine, const DisconnectHandler& onDisconnect) {
+  fd_set rfds;
+  FD_ZERO(&rfds);
+  auto listenFd = listenSock_.native_handle();
+  FD_SET(listenFd, &rfds);
+  purelib::net::socket_native_type maxfd = listenFd;
+  for (const auto& c : clients_) {
+    auto fd = c.sock.native_handle();
+    FD_SET(fd, &rfds);
+    if (fd > maxfd) maxfd = fd;
+  }
 
-    timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = 200 * 1000; // 200ms
-    int rc = ::select(static_cast<int>(maxfd + 1), &rfds, nullptr, nullptr, &tv);
-    if (rc < 0) {
-      // keep running on EINTR
-      if (errno == EINTR) continue;
+  timeval tv;
+  tv.tv_sec = timeoutMs / 1000;
+  tv.tv_usec = (timeoutMs % 1000) * 1000;
+  int rc = ::select(static_cast<int>(maxfd + 1), &rfds, nullptr, nullptr, &tv);
+  if (rc < 0) {
+    if (errno == EINTR) return;
+    return;
+  }
+
+  if (FD_ISSET(listenFd, &rfds)) {
+    for (;;) {
+      auto s = listenSock_.accept();
+      if (!s.is_open()) break;
+      (void)s.set_nonblocking(true);
+      Client c;
+      c.id = nextClientId_++;
+      c.sock = std::move(s);
+      clients_.push_back(std::move(c));
+    }
+  }
+
+  // Read from clients
+  for (size_t idx = 0; idx < clients_.size();) {
+    auto fd = clients_[idx].sock.native_handle();
+    if (!FD_ISSET(fd, &rfds)) { ++idx; continue; }
+
+    char buf[4096];
+    int n = clients_[idx].sock.recv_i(buf, sizeof(buf), 0);
+    if (n <= 0) {
+      ClientInfo info{clients_[idx].id, fd};
+      if (onDisconnect) onDisconnect(info);
+      dropClient(idx);
       continue;
     }
 
-    if (FD_ISSET(listenFd, &rfds)) {
-      for (;;) {
-        auto s = listenSock_.accept();
-        if (!s.is_open()) break;
-        (void)s.set_nonblocking(true);
-        Client c;
-        c.id = nextClientId_++;
-        c.sock = std::move(s);
-        clients_.push_back(std::move(c));
-      }
+    clients_[idx].inbuf.append(buf, n);
+    for (;;) {
+      auto pos = clients_[idx].inbuf.find('\n');
+      if (pos == std::string::npos) break;
+      std::string line = clients_[idx].inbuf.substr(0, pos);
+      clients_[idx].inbuf.erase(0, pos + 1);
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      if (line.empty()) continue;
+
+      ClientInfo info{clients_[idx].id, fd};
+      if (onLine) onLine(info, line);
     }
+    ++idx;
+  }
+}
 
-    // Read from clients
-    for (size_t idx = 0; idx < clients_.size();) {
-      auto fd = clients_[idx].sock.native_handle();
-      if (!FD_ISSET(fd, &rfds)) { ++idx; continue; }
-
-      char buf[4096];
-      int n = clients_[idx].sock.recv_i(buf, sizeof(buf), 0);
-      if (n <= 0) {
-        ClientInfo info{clients_[idx].id, fd};
-        if (onDisconnect) onDisconnect(info);
-        dropClient(idx);
-        continue;
-      }
-
-      clients_[idx].inbuf.append(buf, n);
-      for (;;) {
-        auto pos = clients_[idx].inbuf.find('\n');
-        if (pos == std::string::npos) break;
-        std::string line = clients_[idx].inbuf.substr(0, pos);
-        clients_[idx].inbuf.erase(0, pos + 1);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty()) continue;
-
-        ClientInfo info{clients_[idx].id, fd};
-        if (onLine) onLine(info, line);
-      }
-      ++idx;
+void TcpServer::run(const LineHandler& onLine, const DisconnectHandler& onDisconnect, const TickHandler& onTick) {
+  for (;;) {
+    pollOnce(200, onLine, onDisconnect);
+    if (onTick) {
+      auto now = std::chrono::time_point_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now())
+                     .time_since_epoch()
+                     .count();
+      onTick(static_cast<int64_t>(now));
     }
   }
 }

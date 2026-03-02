@@ -73,11 +73,13 @@ std::string GameServer::serializeSnapshotFor(const std::string& viewerPlayerId) 
   std::ostringstream ss;
   ss << "{\"type\":\"table_state\""
      << ",\"tableId\":" << snap.tableId
+     << ",\"handId\":" << snap.handId
      << ",\"street\":" << q(streetToString(snap.street))
      << ",\"dealer\":" << snap.dealer
      << ",\"sbSeat\":" << snap.sbSeat
      << ",\"bbSeat\":" << snap.bbSeat
      << ",\"toAct\":" << snap.toAct
+     << ",\"actionDeadlineMs\":" << snap.actionDeadlineMs
      << ",\"pot\":" << snap.pot
      << ",\"currentBet\":" << snap.currentBet
      << ",\"board\":[";
@@ -96,6 +98,7 @@ std::string GameServer::serializeSnapshotFor(const std::string& viewerPlayerId) 
        << ",\"name\":" << q(s.name)
        << ",\"chips\":" << s.chips
        << ",\"ready\":" << (s.ready ? "true" : "false")
+       << ",\"auto\":" << (s.autoMode ? "true" : "false")
        << ",\"bet\":" << s.betThisStreet
        << ",\"contributed\":" << s.contributed;
     if (s.hasHole) {
@@ -160,6 +163,11 @@ void GameServer::onLine(const ClientInfo& c, const std::string& line) {
   }
   const std::string type = *typeOpt;
 
+  if (type == "ping") {
+    tcp_.sendLine(c.id, "{\"type\":\"pong\"}");
+    return;
+  }
+
   if (type == "hello") {
     auto nameOpt = obj.getString("name");
     if (!nameOpt || nameOpt->empty()) {
@@ -216,6 +224,37 @@ void GameServer::onLine(const ClientInfo& c, const std::string& line) {
     return;
   }
 
+  if (type == "auto") {
+    auto on = obj.getBool("on");
+    if (!on) { sendError(c.id, "auto requires on:true/false"); return; }
+    if (!table_.setAutoMode(sess.playerId, *on)) { sendError(c.id, "auto failed"); return; }
+    broadcastTableState();
+    return;
+  }
+
+  if (type == "topup") {
+    auto amt = obj.getInt("amount");
+    if (!amt) { sendError(c.id, "topup requires amount"); return; }
+    if (!table_.topUp(sess.playerId, *amt)) { sendError(c.id, "topup failed (maybe in hand)"); return; }
+    broadcastTableState();
+    return;
+  }
+
+  if (type == "hand_history") {
+    uint64_t hid = table_.currentHandId();
+    if (auto v = obj.getInt("handId"); v && *v > 0) hid = static_cast<uint64_t>(*v);
+    auto events = table_.getHandHistory(hid, 500);
+    std::ostringstream ss;
+    ss << "{\"type\":\"hand_history\",\"handId\":" << hid << ",\"events\":[";
+    for (size_t i = 0; i < events.size(); ++i) {
+      if (i) ss << ",";
+      ss << events[i]; // already JSON objects
+    }
+    ss << "]}";
+    tcp_.sendLine(c.id, ss.str());
+    return;
+  }
+
   if (type == "action") {
     auto a = obj.getString("action");
     if (!a) { sendError(c.id, "action requires action"); return; }
@@ -252,7 +291,11 @@ int GameServer::run() {
   }
   tcp_.run(
       [&](const ClientInfo& c, const std::string& line) { onLine(c, line); },
-      [&](const ClientInfo& c) { onDisconnect(c); });
+      [&](const ClientInfo& c) { onDisconnect(c); },
+      [&](int64_t nowMs) {
+        table_.tick(nowMs);
+        (void)table_.startHandIfReady();
+      });
   return 0;
 }
 

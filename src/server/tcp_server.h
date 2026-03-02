@@ -18,10 +18,13 @@ class TcpServer {
 public:
   using LineHandler = std::function<void(const ClientInfo&, const std::string& line)>;
   using DisconnectHandler = std::function<void(const ClientInfo&)>;
+  using TickHandler = std::function<void(int64_t nowMs)>;
 
   TcpServer() = default;
   bool listen(uint16_t port, std::string& err);
-  void run(const LineHandler& onLine, const DisconnectHandler& onDisconnect);
+  // Process I/O once and return; timeoutMs is the max wait in select().
+  void pollOnce(int timeoutMs, const LineHandler& onLine, const DisconnectHandler& onDisconnect);
+  void run(const LineHandler& onLine, const DisconnectHandler& onDisconnect, const TickHandler& onTick = {});
 
   bool sendLine(int64_t clientId, const std::string& line);
   void broadcastLine(const std::vector<int64_t>& clientIds, const std::string& line);

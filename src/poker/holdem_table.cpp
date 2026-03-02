@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <set>
+#include <sstream>
 
 #include "poker/hand_eval.h"
 
@@ -18,6 +19,18 @@ HoldemTable::HoldemTable(Config cfg) : cfg_(cfg) {
   needAction_.resize(cfg_.maxSeats, false);
   rng_.seed(static_cast<uint64_t>(
       std::chrono::high_resolution_clock::now().time_since_epoch().count()));
+}
+
+void HoldemTable::setBlinds(int64_t smallBlind, int64_t bigBlind) {
+  if (smallBlind <= 0 || bigBlind <= 0 || smallBlind >= bigBlind) return;
+  cfg_.smallBlind = smallBlind;
+  cfg_.bigBlind = bigBlind;
+  if (minRaiseSize_ <= 0) minRaiseSize_ = cfg_.bigBlind;
+}
+
+void HoldemTable::setActionTimeoutMs(int64_t ms) {
+  if (ms < 1000) ms = 1000;
+  actionTimeoutMs_ = ms;
 }
 
 int HoldemTable::findSeatByPlayerId(const std::string& playerId) const {
@@ -37,6 +50,7 @@ bool HoldemTable::seatPlayer(int seatIdx, std::string playerId, std::string name
   s.name = std::move(name);
   s.chips = chips;
   s.ready = false;
+  s.autoMode = false;
   s.status = PlayerStatus::Seated;
   return true;
 }
@@ -47,6 +61,26 @@ bool HoldemTable::setReady(const std::string& playerId, bool ready) {
   if (isHandRunning()) return false;
   if (seats_[idx].status == PlayerStatus::Empty) return false;
   seats_[idx].ready = ready;
+  return true;
+}
+
+bool HoldemTable::setAutoMode(const std::string& playerId, bool autoMode) {
+  int idx = findSeatByPlayerId(playerId);
+  if (idx < 0) return false;
+  if (seats_[idx].status == PlayerStatus::Empty) return false;
+  seats_[idx].autoMode = autoMode;
+  return true;
+}
+
+bool HoldemTable::topUp(const std::string& playerId, int64_t amount) {
+  if (amount <= 0) return false;
+  int idx = findSeatByPlayerId(playerId);
+  if (idx < 0) return false;
+  if (seats_[idx].status == PlayerStatus::Empty) return false;
+  if (isHandRunning() && (seats_[idx].status == PlayerStatus::InHand || seats_[idx].status == PlayerStatus::AllIn)) {
+    return false;
+  }
+  seats_[idx].chips += amount;
   return true;
 }
 
@@ -141,12 +175,16 @@ void HoldemTable::resetForNewHand() {
   sbSeat_ = -1;
   bbSeat_ = -1;
   toAct_ = -1;
+  actionDeadlineMs_ = 0;
   pot_ = 0;
   currentBet_ = 0;
   minRaiseSize_ = cfg_.bigBlind;
   lastAggressiveTo_ = 0;
   board_.clear();
   shuffleDeck();
+  curEvents_.clear();
+  handId_++;
+  logEvent(std::string("{\"type\":\"hand_start\",\"handId\":") + std::to_string(handId_) + "}");
 
   for (auto& s : seats_) {
     if (s.status == PlayerStatus::Empty) continue;
@@ -157,7 +195,6 @@ void HoldemTable::resetForNewHand() {
       s.status = PlayerStatus::InHand;
     } else {
       s.status = PlayerStatus::Seated;
-      s.ready = false;
     }
   }
 }
@@ -188,10 +225,16 @@ bool HoldemTable::startHandIfReady() {
       }
     }
   }
+  logEvent(std::string("{\"type\":\"deal_hole\",\"handId\":") + std::to_string(handId_) + "}");
 
   // Post blinds
   if (sbSeat_ >= 0) postBlind(sbSeat_, cfg_.smallBlind);
   if (bbSeat_ >= 0) postBlind(bbSeat_, cfg_.bigBlind);
+  logEvent(std::string("{\"type\":\"post_blinds\",\"handId\":") + std::to_string(handId_) +
+           ",\"sbSeat\":" + std::to_string(sbSeat_) +
+           ",\"bbSeat\":" + std::to_string(bbSeat_) +
+           ",\"sb\":" + std::to_string(cfg_.smallBlind) +
+           ",\"bb\":" + std::to_string(cfg_.bigBlind) + "}");
 
   currentBet_ = cfg_.bigBlind;
   lastAggressiveTo_ = currentBet_;
@@ -218,6 +261,7 @@ void HoldemTable::startBettingRound(Street st, int firstToAct) {
   if (toAct_ >= 0 && !needAction_[toAct_]) {
     toAct_ = nextInHandCanActSeat(toAct_);
   }
+  actionDeadlineMs_ = 0;
 }
 
 LegalActions HoldemTable::legalForSeat(int seatIdx) const {
@@ -280,6 +324,16 @@ bool HoldemTable::act(const std::string& playerId, const Action& action, std::st
 
   auto la = legalForSeat(seatIdx);
   const std::string t = action.type;
+  {
+    std::ostringstream ss;
+    ss << "{\"type\":\"player_action\",\"handId\":" << handId_
+       << ",\"seat\":" << seatIdx
+       << ",\"playerId\":\"" << seats_[seatIdx].playerId << "\""
+       << ",\"action\":\"" << t << "\"";
+    if (t == "bet" || t == "raise") ss << ",\"amount\":" << action.amount;
+    ss << "}";
+    logEvent(ss.str());
+  }
 
   if (t == "fold") {
     if (!la.canFold) { err = "fold not allowed"; return false; }
@@ -345,17 +399,21 @@ bool HoldemTable::act(const std::string& playerId, const Action& action, std::st
   if (remaining == 1 && last >= 0) {
     seats_[last].chips += pot_;
     pot_ = 0;
+    logEvent(std::string("{\"type\":\"hand_end\",\"handId\":") + std::to_string(handId_) + ",\"reason\":\"all_folded\"}");
+    history_.push_back(HandLog{handId_, curEvents_});
+    if (history_.size() > 200) history_.pop_front();
+    curEvents_.clear();
     // end hand
     for (auto& s : seats_) {
       if (s.status != PlayerStatus::Empty) {
         s.status = PlayerStatus::Seated;
-        s.ready = false;
         s.betThisStreet = 0;
         s.contributed = 0;
         s.hasHole = false;
       }
     }
     toAct_ = -1;
+    actionDeadlineMs_ = 0;
     board_.clear();
     return true;
   }
@@ -366,6 +424,7 @@ bool HoldemTable::act(const std::string& playerId, const Action& action, std::st
     advanceStreetOrShowdown();
   } else {
     toAct_ = next;
+    actionDeadlineMs_ = 0;
   }
   return true;
 }
@@ -390,10 +449,12 @@ void HoldemTable::advanceStreetOrShowdown() {
     board_.push_back(draw());
     board_.push_back(draw());
     board_.push_back(draw());
+    logEvent(std::string("{\"type\":\"deal_flop\",\"handId\":") + std::to_string(handId_) + "}");
   };
   auto dealOne = [&]() {
     (void)draw(); // burn
     board_.push_back(draw());
+    logEvent(std::string("{\"type\":\"deal_card\",\"handId\":") + std::to_string(handId_) + "}");
   };
 
   if (street_ == Street::Preflop) {
@@ -525,16 +586,67 @@ void HoldemTable::settleShowdown() {
   }
   pot_ = 0;
 
+  logEvent(std::string("{\"type\":\"hand_end\",\"handId\":") + std::to_string(handId_) + ",\"reason\":\"showdown\"}");
+  history_.push_back(HandLog{handId_, curEvents_});
+  if (history_.size() > 200) history_.pop_front();
+  curEvents_.clear();
+
   // End hand: reset statuses to seated and clear ready flags.
   for (auto& s : seats_) {
     if (s.status == PlayerStatus::Empty) continue;
     s.status = PlayerStatus::Seated;
-    s.ready = false;
     s.betThisStreet = 0;
     s.contributed = 0;
     s.hasHole = false;
   }
   toAct_ = -1;
+  actionDeadlineMs_ = 0;
+}
+
+void HoldemTable::setToAct(int seatIdx, int64_t nowMs) {
+  toAct_ = seatIdx;
+  if (seatIdx < 0 || nowMs <= 0) {
+    actionDeadlineMs_ = 0;
+    return;
+  }
+  actionDeadlineMs_ = nowMs + actionTimeoutMs_;
+}
+
+void HoldemTable::logEvent(std::string ev) {
+  curEvents_.push_back(std::move(ev));
+}
+
+std::vector<std::string> HoldemTable::getHandHistory(uint64_t handId, int limit) const {
+  if (limit <= 0) return {};
+  for (auto it = history_.rbegin(); it != history_.rend(); ++it) {
+    if (it->handId == handId) {
+      if (static_cast<int>(it->events.size()) <= limit) return it->events;
+      return std::vector<std::string>(it->events.end() - limit, it->events.end());
+    }
+  }
+  return {};
+}
+
+void HoldemTable::tick(int64_t nowMs) {
+  if (toAct_ < 0) return;
+  if (actionTimeoutMs_ <= 0) return;
+  if (actionDeadlineMs_ == 0) {
+    setToAct(toAct_, nowMs);
+    return;
+  }
+  if (nowMs <= 0 || nowMs < actionDeadlineMs_) return;
+
+  // Timeout policy: check if possible, else fold.
+  if (toAct_ < 0 || toAct_ >= static_cast<int>(seats_.size())) return;
+  auto& s = seats_[toAct_];
+  if (s.status != PlayerStatus::InHand) return;
+  auto la = legalForSeat(toAct_);
+  Action a;
+  a.type = la.canCheck ? "check" : "fold";
+  std::string err;
+  (void)act(s.playerId, a, err);
+
+  if (toAct_ >= 0) setToAct(toAct_, nowMs);
 }
 
 TableSnapshot HoldemTable::snapshotFor(const std::string& viewerPlayerId) const {
@@ -545,7 +657,9 @@ TableSnapshot HoldemTable::snapshotFor(const std::string& viewerPlayerId) const 
   snap.sbSeat = sbSeat_;
   snap.bbSeat = bbSeat_;
   snap.street = street_;
+  snap.handId = handId_;
   snap.toAct = toAct_;
+  snap.actionDeadlineMs = actionDeadlineMs_;
   snap.pot = pot_;
   snap.currentBet = currentBet_;
   snap.smallBlind = cfg_.smallBlind;
