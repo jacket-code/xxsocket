@@ -397,8 +397,11 @@ bool HoldemTable::act(const std::string& playerId, const Action& action, std::st
     }
   }
   if (remaining == 1 && last >= 0) {
-    seats_[last].chips += pot_;
+    const int64_t win = pot_;
+    seats_[last].chips += win;
     pot_ = 0;
+    logEvent(std::string("{\"type\":\"winner\",\"handId\":") + std::to_string(handId_) +
+             ",\"seat\":" + std::to_string(last) + ",\"amount\":" + std::to_string(win) + "}");
     logEvent(std::string("{\"type\":\"hand_end\",\"handId\":") + std::to_string(handId_) + ",\"reason\":\"all_folded\"}");
     history_.push_back(HandLog{handId_, curEvents_});
     if (history_.size() > 200) history_.pop_front();
@@ -449,12 +452,14 @@ void HoldemTable::advanceStreetOrShowdown() {
     board_.push_back(draw());
     board_.push_back(draw());
     board_.push_back(draw());
-    logEvent(std::string("{\"type\":\"deal_flop\",\"handId\":") + std::to_string(handId_) + "}");
+    logEvent(std::string("{\"type\":\"deal_flop\",\"handId\":") + std::to_string(handId_) +
+             ",\"cards\":[\"" + board_[0].toString() + "\",\"" + board_[1].toString() + "\",\"" + board_[2].toString() + "\"]}");
   };
   auto dealOne = [&]() {
     (void)draw(); // burn
     board_.push_back(draw());
-    logEvent(std::string("{\"type\":\"deal_card\",\"handId\":") + std::to_string(handId_) + "}");
+    logEvent(std::string("{\"type\":\"deal_card\",\"handId\":") + std::to_string(handId_) +
+             ",\"card\":\"" + board_.back().toString() + "\"}");
   };
 
   if (street_ == Street::Preflop) {
@@ -563,6 +568,18 @@ void HoldemTable::settleShowdown() {
       if (it != hv.end() && it->second == best) winners.push_back(seat);
     }
     if (winners.empty()) continue;
+    {
+      std::ostringstream ss;
+      ss << "{\"type\":\"pot_award\",\"handId\":" << handId_
+         << ",\"amount\":" << p.size
+         << ",\"winners\":[";
+      for (size_t i = 0; i < winners.size(); ++i) {
+        if (i) ss << ",";
+        ss << winners[i];
+      }
+      ss << "]}";
+      logEvent(ss.str());
+    }
     const int64_t share = p.size / static_cast<int64_t>(winners.size());
     int64_t extra = p.size - share * static_cast<int64_t>(winners.size());
     for (int seat : winners) {

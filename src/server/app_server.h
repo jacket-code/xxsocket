@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "poker/holdem_table.h"
+#include "server/config.h"
 #include "server/rate_limiter.h"
 #include "server/store.h"
 #include "server/tcp_server.h"
@@ -57,6 +58,7 @@ private:
   uint16_t port_;
   TcpServer tcp_;
   RateLimiter rl_;
+  ConfigManager cfgMgr_;
   Store store_;
 
   int nextRoomId_ = 2;

@@ -98,9 +98,21 @@ void TcpServer::pollOnce(int timeoutMs, const LineHandler& onLine, const Disconn
     }
 
     clients_[idx].inbuf.append(buf, n);
+      if (clients_[idx].inbuf.size() > 1024 * 1024) {
+        ClientInfo info{clients_[idx].id, fd};
+        if (onDisconnect) onDisconnect(info);
+        dropClient(idx);
+        continue;
+      }
     for (;;) {
       auto pos = clients_[idx].inbuf.find('\n');
       if (pos == std::string::npos) break;
+        if (pos > 16 * 1024) {
+          ClientInfo info{clients_[idx].id, fd};
+          if (onDisconnect) onDisconnect(info);
+          dropClient(idx);
+          break;
+        }
       std::string line = clients_[idx].inbuf.substr(0, pos);
       clients_[idx].inbuf.erase(0, pos + 1);
       if (!line.empty() && line.back() == '\r') line.pop_back();

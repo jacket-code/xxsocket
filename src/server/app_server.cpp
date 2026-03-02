@@ -45,6 +45,7 @@ std::string AppServer::q(const std::string& s) { return "\"" + jsonlite::escape(
 AppServer::AppServer(uint16_t port, std::string dataDir)
     : port_(port),
       rl_(RateLimiter::Config{60, 40}),
+      cfgMgr_(dataDir + "/config.json"),
       store_(std::move(dataDir)) {}
 
 std::string AppServer::roomTypeToString(RoomType t) const {
@@ -81,7 +82,7 @@ bool AppServer::ensureLobbyCreated(int64_t nowMs, std::string& err) {
   cfg.smallBlind = lobby.sb;
   cfg.bigBlind = lobby.bb;
   tables_.emplace(1, TableNode(1, 1, cfg));
-  tables_.at(1).table.setActionTimeoutMs(15000);
+  tables_.at(1).table.setActionTimeoutMs(cfgMgr_.config().actionTimeoutMs);
   (void)nowMs;
   return true;
 }
@@ -257,6 +258,18 @@ void AppServer::onDisconnect(const ClientInfo& c) {
 }
 
 void AppServer::onTick(int64_t nowMs) {
+  // hot-reload config (best-effort)
+  {
+    std::string err;
+    if (cfgMgr_.tickReload(nowMs, err)) {
+      const auto& cfg = cfgMgr_.config();
+      rl_ = RateLimiter(RateLimiter::Config{cfg.rlCapacity, cfg.rlRefillPerSecond});
+      for (auto& kv : tables_) {
+        kv.second.table.setActionTimeoutMs(cfg.actionTimeoutMs);
+      }
+    }
+  }
+
   // tick all tables: timeout/autoplay + autostart
   for (auto& kv : tables_) {
     kv.second.table.tick(nowMs);
@@ -265,7 +278,9 @@ void AppServer::onTick(int64_t nowMs) {
   tickTournaments(nowMs);
   // flush store periodically (best-effort)
   static int64_t lastFlush = 0;
-  if (nowMs - lastFlush > 5000) {
+  int64_t flushMs = cfgMgr_.config().storeFlushMs;
+  if (flushMs < 1000) flushMs = 1000;
+  if (nowMs - lastFlush > flushMs) {
     std::string err;
     (void)store_.flush(err);
     lastFlush = nowMs;
@@ -278,6 +293,27 @@ void AppServer::maybeStartTournament(int roomId, int64_t nowMs) {
   auto& t = it->second;
   if (t.started || t.finished) return;
   if (t.registrants.size() < 2) return;
+  const RoomConfig* r = getRoom(roomId);
+  if (!r) return;
+
+  // For MTT, create enough tables to seat all registrants.
+  if (t.type == RoomType::Mtt) {
+    int maxSeats = r->maxSeats;
+    if (maxSeats < 2) maxSeats = 2;
+    int need = static_cast<int>((t.registrants.size() + static_cast<size_t>(maxSeats) - 1) / static_cast<size_t>(maxSeats));
+    while (static_cast<int>(t.tableIds.size()) < need) {
+      int tid = nextTableId_++;
+      poker::HoldemTable::Config cfg;
+      cfg.tableId = tid;
+      cfg.maxSeats = maxSeats;
+      cfg.smallBlind = t.blindLevels.empty() ? r->sb : t.blindLevels[0].first;
+      cfg.bigBlind = t.blindLevels.empty() ? r->bb : t.blindLevels[0].second;
+      tables_.emplace(tid, TableNode(tid, roomId, cfg));
+      tables_.at(tid).table.setActionTimeoutMs(cfgMgr_.config().actionTimeoutMs);
+      t.tableIds.push_back(tid);
+    }
+  }
+
   if (t.tableIds.empty()) return;
 
   t.started = true;
@@ -409,7 +445,7 @@ void AppServer::onLine(const ClientInfo& c, const std::string& line, int64_t now
     } else {
       acc.playerId = playerId;
       acc.name = sess.name;
-      acc.balance = 100000; // demo starting coins
+      acc.balance = cfgMgr_.config().defaultBalance;
       acc.createdAtMs = nowMs;
       acc.updatedAtMs = nowMs;
     }
@@ -457,7 +493,7 @@ void AppServer::onLine(const ClientInfo& c, const std::string& line, int64_t now
       cfg.smallBlind = rc.sb;
       cfg.bigBlind = rc.bb;
       tables_.emplace(tid, TableNode(tid, rc.roomId, cfg));
-      tables_.at(tid).table.setActionTimeoutMs(15000);
+      tables_.at(tid).table.setActionTimeoutMs(cfgMgr_.config().actionTimeoutMs);
     } else if (rc.type == RoomType::Sng || rc.type == RoomType::Mtt) {
       Tournament t;
       t.roomId = rc.roomId;
@@ -474,7 +510,7 @@ void AppServer::onLine(const ClientInfo& c, const std::string& line, int64_t now
       cfg.smallBlind = t.blindLevels[0].first;
       cfg.bigBlind = t.blindLevels[0].second;
       tables_.emplace(tid, TableNode(tid, rc.roomId, cfg));
-      tables_.at(tid).table.setActionTimeoutMs(15000);
+      tables_.at(tid).table.setActionTimeoutMs(cfgMgr_.config().actionTimeoutMs);
       t.tableIds.push_back(tid);
       tournaments_[rc.roomId] = t;
     }
@@ -698,6 +734,11 @@ void AppServer::onLine(const ClientInfo& c, const std::string& line, int64_t now
   }
 
   if (type == "metrics") {
+    const auto& ck = cfgMgr_.config().adminKey;
+    if (!ck.empty()) {
+      auto k = obj.getString("adminKey");
+      if (!k || *k != ck) { sendError(c.id, "admin unauthorized"); return; }
+    }
     std::ostringstream ss;
     ss << "{\"type\":\"metrics\""
        << ",\"connectionsTotal\":" << totalConnections_
@@ -710,11 +751,52 @@ void AppServer::onLine(const ClientInfo& c, const std::string& line, int64_t now
     return;
   }
 
+  if (type == "admin") {
+    const auto& ck = cfgMgr_.config().adminKey;
+    if (ck.empty()) { sendError(c.id, "admin disabled"); return; }
+    auto k = obj.getString("adminKey");
+    if (!k || *k != ck) { sendError(c.id, "admin unauthorized"); return; }
+    auto cmd = obj.getString("cmd");
+    if (!cmd) { sendError(c.id, "admin requires cmd"); return; }
+    if (*cmd == "set_blinds") {
+      auto tid = obj.getInt("tableId");
+      auto sb = obj.getInt("sb");
+      auto bb = obj.getInt("bb");
+      if (!tid || !sb || !bb) { sendError(c.id, "set_blinds requires tableId,sb,bb"); return; }
+      auto* tn = getTable(static_cast<int>(*tid));
+      if (!tn) { sendError(c.id, "table not found"); return; }
+      tn->table.setBlinds(*sb, *bb);
+      broadcastTable(*tn);
+      sendInfo(c.id, "ok");
+      return;
+    }
+    if (*cmd == "create_table") {
+      auto rid = obj.getInt("roomId");
+      if (!rid) { sendError(c.id, "create_table requires roomId"); return; }
+      const RoomConfig* r = getRoom(static_cast<int>(*rid));
+      if (!r) { sendError(c.id, "room not found"); return; }
+      int tid = nextTableId_++;
+      poker::HoldemTable::Config cfg;
+      cfg.tableId = tid;
+      cfg.maxSeats = r->maxSeats;
+      cfg.smallBlind = r->sb;
+      cfg.bigBlind = r->bb;
+      tables_.emplace(tid, TableNode(tid, r->roomId, cfg));
+      tables_.at(tid).table.setActionTimeoutMs(cfgMgr_.config().actionTimeoutMs);
+      tcp_.sendLine(c.id, serializeTables(r->roomId));
+      return;
+    }
+    sendError(c.id, "unknown admin cmd");
+    return;
+  }
+
   sendError(c.id, "unknown type");
 }
 
 int AppServer::run() {
   std::string err;
+  (void)cfgMgr_.loadNow(err);
+  rl_ = RateLimiter(RateLimiter::Config{cfgMgr_.config().rlCapacity, cfgMgr_.config().rlRefillPerSecond});
   if (!store_.load(err)) {
     // continue in memory
   }

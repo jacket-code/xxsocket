@@ -25,6 +25,7 @@ add_executable(poker_server
   src/server/tcp_server.cpp
   src/server/app_server.cpp
   src/server/store.cpp
+  src/server/config.cpp
   # legacy single-table protocol (kept for reference; not used by main)
   src/server/protocol.cpp
 )

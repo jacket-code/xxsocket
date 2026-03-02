@@ -15,6 +15,17 @@ cmake --build build -j
 ./build/poker_server 7777 data
 ```
 
+服务端会在 `data/` 目录下生成/读取：
+
+- `data/accounts.jsonl`: 玩家账户余额（JSONL）
+- `data/config.json`: 服务端配置（可选，支持热加载；单行 JSON 对象）
+
+示例 `data/config.json`：
+
+```json
+{"defaultBalance":100000,"actionTimeoutMs":15000,"storeFlushMs":5000,"adminKey":"","rlCapacity":60,"rlRefillPerSecond":40}
+```
+
 ### 快速试玩（用 netcat）
 
 开两个终端分别连接：
